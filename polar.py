@@ -1,12 +1,11 @@
 import torch
 import numpy as np
 from reliability_sequence import Reliability_Sequence
-from utils import snr_db2sigma, corrupt_signal, min_sum_log_sum_exp, log_sum_exp
-
+from utils import snr_db2sigma,corrupt_signal,min_sum_log_sum_exp,log_sum_exp
 class PolarCode:
-    def __init__(self, n, K, rs=None, Fr=None, use_cuda=True, infty=1000, hard_decision=False, lse='lse'):
+    def __init__(self, n, K, rs=None, Fr = None, use_cuda = True,infty=1000,hard_decision=False,lse='lse'):
         self.n = n
-        self.N = 2**n
+        self.N =2**n
         self.K = K
         self.device = torch.device("cuda" if use_cuda else "cpu")
         self.infty = infty
@@ -45,21 +44,23 @@ class PolarCode:
             self.unsorted_frozen_positions = self.frozen_positions
             self.frozen_positions.sort()
     
-    def encode(self, message):
-        u = torch.ones(message.shape[0], self.N, dtype=torch.float).to(message.device) #[B,N]
-        u[:, self.info_positions] = message
-        for d in range(0, self.n):
+    def encode(self,message):
+        u = torch.ones(message.shape[0],self.N,dtype=torch.float).to(message.device) #[B,N]
+        u[:,self.info_positions] = message
+        for d in range(0,self.n):
             num_bits = 2**d
-            for i in np.arange(0, self.N, 2*num_bits):
+            for i in np.arange(0,self.N,2*num_bits):
                 #[u0 u1] ---> [u0 xor(u0 u1)]
-                u = torch.cat((u[:,:i], u[:,i:i+num_bits].clone()*u[:,i+num_bits:i+2*num_bits], u[:,i+num_bits:]), dim=1)
+                u = torch.cat((u[:,:i],u[:,i:i+num_bits].clone()*u[:,i+num_bits:i+2*num_bits],u[:,i+num_bits:]),dim=1)
         
         return u
     
-    def channel(self, code, snr):
+    def channel(self,code,snr):
         sigma = snr_db2sigma(snr)
 
-        r = corrupt_signal(code, sigma)
+        r = corrupt_signal(code,sigma)
+        # Debug check
+        print(f"Channel output range: {r.min().item()} to {r.max().item()}")
 
         return r
         
@@ -72,16 +73,26 @@ class PolarCode:
 
 
     def updateLLR(self, leaf_position, llrs, partial_llrs=None, prior=None):
-        #START
         depth = self.n
-        decoded_bits = partial_llrs[:, 0].clone()
+        decoded_bits = partial_llrs[:,0].clone()
         if prior is None:
-            prior = torch.zeros(self.N) #priors
-        llrs, partial_llrs, decoded_bits = self.partial_decode(llrs, partial_llrs, depth, 0, leaf_position, prior, decoded_bits)
+            prior = torch.zeros(self.N, device=llrs.device) #priors
+        
+        # Modified to ensure proper LLR propagation
+        llrs, partial_llrs, decoded_bits = self.partial_decode(
+            llrs, partial_llrs, depth, 0, leaf_position, prior, decoded_bits
+        )
+        
+        # Debug check
+        if torch.all(llrs == 0):
+            print(f"Warning: All zeros in LLRs after position {leaf_position}")
+        
         return llrs, decoded_bits
 
 
     def partial_decode(self, llrs, partial_llrs, depth, bit_position, leaf_position, prior, decoded_bits=None):
+        print(f"Depth: {depth}, Bit position: {bit_position}")
+        print(f"Input LLRs (non-zero count): {(llrs != 0).sum().item()}/{llrs.numel()}")
         # Function to call recursively, for partial SC decoder.
         # We are assuming that u_0, u_1, .... , u_{leaf_position -1} bits are known.
         # Partial sums computes the sums got through Plotkin encoding operations of known bits, to avoid recomputation.
@@ -157,9 +168,12 @@ class PolarCode:
             llrs[:, depth-1, right_bit_position*half_index:(right_bit_position+1)*half_index] = Lv
             llrs, partial_llrs, decoded_bits = self.partial_decode(llrs, partial_llrs, depth-1, right_bit_position, leaf_position, prior, decoded_bits)
 
+            print(f"Output LLRs (non-zero count): {(llrs != 0).sum().item()}/{llrs.numel()}")
+
             return llrs, partial_llrs, decoded_bits
 
     def updatePartialSums(self, leaf_position, decoded_bits, partial_llrs):
+
         u = decoded_bits.clone()
         u[:, leaf_position+1:] = 0
 
@@ -171,38 +185,60 @@ class PolarCode:
                 u = torch.cat((u[:, :i], u[:, i:i+num_bits].clone() * u[:, i+num_bits: i+2*num_bits], u[:, i+num_bits:]), dim=1)
         partial_llrs[:, self.n] = u
         return partial_llrs
+    
+    def clip_llrs(self, llrs, clip_value=20.0):
+        """Clip LLR values to prevent numerical instability"""
+        return torch.clamp(llrs, -clip_value, clip_value)
 
-    # This needs to be added to your polar.py file
+    def sc_decode_new(self, corrupted_codewords, snr, use_gt=None, channel='awgn'):
+        """Modified SC decoder that stores all intermediate LLR values"""
+        assert channel in ['awgn', 'bsc']
 
-    def sc_decode_new(self, corrupted_codewords, return_llr_matrix=False):
-        B = corrupted_codewords.shape[0]
-        llr_array = torch.zeros(B, self.n + 1, self.N, device=corrupted_codewords.device)
-        decoded_bits = torch.zeros(B, self.N, device=corrupted_codewords.device)
-        partial_llrs = torch.zeros(B, self.n + 1, self.N, device=corrupted_codewords.device)
-        priors = torch.zeros(B, self.N, device=corrupted_codewords.device)
+        if channel == 'awgn':
+            noise_sigma = snr_db2sigma(snr)
+            # llrs = (2/noise_sigma**2)*corrupted_codewords
+            # Modify the initial LLR calculation:
+            initial_scale = min(2/noise_sigma**2, 1.0)  # Cap the scaling factor
+            llrs = initial_scale * corrupted_codewords
 
-        # Store LLR matrix only at root node level per bit (depth 0)
-        if return_llr_matrix:
-            llr_matrix = torch.zeros(B, self.N, device=corrupted_codewords.device)
+        # Initialize arrays
+        batch_size = corrupted_codewords.shape[0]
+        u_hat = torch.zeros(batch_size, self.N, device=corrupted_codewords.device)
+        llr_array, partial_llrs = self.define_partial_arrays(llrs)
+        
+        # Initialize LLR matrix with proper dimensions
+        llr_matrix = torch.zeros(batch_size, self.n+1, self.N, device=corrupted_codewords.device)
+        
+        # Store initial LLRs (stage n)
+        llr_matrix[:, self.n, :] = llr_array[:, self.n, :].clone()
 
-        # Initialize LLRs at depth = n (leaf level)
-        llr_array[:, self.n, :] = corrupted_codewords
+        priors = torch.zeros(self.N, device=corrupted_codewords.device)
+        priors[self.frozen_positions] = 20.0  # For 0 bits
+        priors[self.frozen_positions] = -20.0  # For 1 bits (if needed)
 
         for ii in range(self.N):
+            # Update LLRs for current bit
             llr_array, decoded_bits = self.updateLLR(ii, llr_array.clone(), partial_llrs, priors)
-            if return_llr_matrix:
-                # Store the LLR value at the root node (depth = 0) for bit ii
-                llr_matrix[:, ii] = llr_array[:, 0, ii]
-
-        if return_llr_matrix:
-            return llr_matrix.clone(), decoded_bits
-        else:
-            return llr_array[:, 0, :].clone(), decoded_bits
-
-
+            llr_array = self.clip_llrs(llr_array)
             
-def get_frozen(N, K, rs):
-    rs = rs[rs < N]
+            # Store LLRs at each stage
+            for stage in range(self.n):
+                llr_matrix[:, stage, :] = llr_array[:, stage, :].clone()
+            
+            # Make decision
+            if use_gt is None:
+                u_hat[:, ii] = torch.sign(llr_array[:, 0, ii])
+            else:
+                u_hat[:, ii] = use_gt[:, ii]
+
+            # Update partial sums
+            partial_llrs = self.updatePartialSums(ii, u_hat, partial_llrs)
+
+        decoded_bits = u_hat[:, self.info_positions]
+        return llr_array[:, 0, :].clone(), decoded_bits, llr_matrix
+        
+def get_frozen(N,K,rs):
+    rs = rs[rs<N]
     Fr = rs[K:].copy()
     Fr.sort()
     return Fr
