@@ -186,7 +186,7 @@ class PolarCode:
         partial_llrs[:, self.n] = u
         return partial_llrs
     
-    def clip_llrs(self, llrs, clip_value=20.0):
+    def clip_llrs(self, llrs, clip_value=100.0):
         """Clip LLR values to prevent numerical instability"""
         return torch.clamp(llrs, -clip_value, clip_value)
 
@@ -225,10 +225,10 @@ class PolarCode:
 
         if channel == 'awgn':
             noise_sigma = snr_db2sigma(snr)
-            # llrs = (2/noise_sigma**2)*corrupted_codewords
+            llrs = (2/noise_sigma**2)*corrupted_codewords
             # Modify the initial LLR calculation:
-            initial_scale = min(2/noise_sigma**2, 1.0)  # Cap the scaling factor
-            llrs = initial_scale * corrupted_codewords
+            # initial_scale = min(2/noise_sigma**2, 1.0)  # Cap the scaling factor
+            # llrs = initial_scale * corrupted_codewords
 
         # Initialize arrays
         batch_size = corrupted_codewords.shape[0]
@@ -243,7 +243,7 @@ class PolarCode:
 
         priors = torch.zeros(self.N, device=corrupted_codewords.device)
         priors[self.frozen_positions] = 20.0  # For 0 bits
-        priors[self.frozen_positions] = -20.0  # For 1 bits (if needed)
+        # priors[self.frozen_positions] = -20.0  # For 1 bits (if needed)
 
         for ii in range(self.N):
             # Update LLRs for current bit
